@@ -1,20 +1,21 @@
 ---
-title: 'Predicting Violent Incidents in New Orleans: An Analysis of Calls for Service
-  Data'
-author: "Connor Burruss"
+title: 'Predicting Violent Incidents in New Orleans: An Analysis of Calls for Service Data'
+author: "c-burruss"
 date: "March 14, 2025"
+output:
   pdf_document:
     toc: true
     toc_depth: 2
     fig_caption: true
   html_document:
     toc: true
-    toc_depth: '2'
+    toc_depth: 2
     df_print: paged
 ---
 
+
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
 ```
 
 # 1. Introduction and Overview
@@ -62,7 +63,7 @@ packages_api <- c('RSocrata')
 # Function to check and install packages
 install_if_missing <- function(package) {
   if (!require(package, character.only = TRUE)) {
-    install.packages(package)
+    install.packages(package, repos = 'source')
     library(package, character.only = TRUE)
   }
 }
