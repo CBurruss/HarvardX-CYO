@@ -1,0 +1,1253 @@
+---
+title: 'Predicting Violent Incidents in New Orleans: An Analysis of Calls for Service Data'
+author: "c-burruss"
+date: "March 14, 2025"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    df_print: paged
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    fig_caption: true
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+```
+
+# 1. Introduction and Overview
+
+## 1.1 Executive Summary
+
+This analysis explores the relationship between various urban disorder indicators and violent incidents in New Orleans neighborhoods. By examining data from the city's calls for service (CFS) system alongside other civic datasets, we investigate whether factors such as code violations, streetlight outages, abandoned vehicles, and lot abatements can serve as predictors of violent incidents. The project applies statistical analysis and machine learning techniques to identify spatial patterns, assess correlations, and develop predictive models.
+
+Key findings reveal strong correlations between urban disorder indicators (particularly code violations and streetlight outages) and violent incidents. Our random forest model achieved the best predictive performance with an R² of 0.76, suggesting non-linear relationships between predictors and violent incidents. This understanding can assist city planners, law enforcement, and community organizations in prioritizing resources and interventions to improve public safety.
+
+## 1.2 Dataset Description
+
+The analysis utilizes several datasets from the City of New Orleans open data portal:
+
+1. **Calls for Service (2023)**: Police response data including incident type, location, and time. This dataset contains `r nrow(read.csv("./data/cfs-2023.csv"))` records with key variables including incident type, timestamp, and geocoded location.
+
+2. **Code Violations**: Records of property maintenance and zoning violations. This dataset provides information on `r nrow(read.csv("./data/violations.csv"))` code enforcement cases.
+
+3. **311 Calls**: Citizen reports of issues including streetlight outages and abandoned vehicles. The dataset contains `r nrow(read.csv("./data/311.csv"))` service requests.
+
+4. **Chapter 66 Lot Abatements**: Records of city-initiated lot clean-ups for properties in violation. This dataset tracks `r nrow(read.csv("./data/ch66.csv"))` abatement cases.
+
+5. **Neighborhood Statistical Areas**: Geographic boundaries defining New Orleans neighborhoods, providing spatial context for our analysis.
+
+These datasets were selected based on theoretical frameworks suggesting relationships between urban disorder and crime, particularly the "broken windows" theory proposed by Kelling and Wilson (1982).
+
+
+## 1.3 Project Goals
+
+The primary objectives of this analysis are to:
+1. Identify spatial patterns of violent incidents across New Orleans neighborhoods.
+2. Assess correlations between urban disorder indicators and violent incidents.
+3. Develop predictive models to determine which factors best predict neighborhood violence.
+4. Provide data-driven insights to inform community safety initiatives.
+
+To achieve these goals, we employ a combination of geospatial analysis, statistical correlation tests, and machine learning models. We compare the performance of multiple modeling approaches, including linear regression, random forest, elastic net regression, and multivariate adaptive regression splines (MARS), to identify the most effective predictive framework.
+
+# 2. Methods and Analysis
+
+## 2.1 Data Preparation
+
+In this section, we prepare the environment, define helper functions, and acquire the necessary datasets. We use a combination of R packages for spatial analysis (`sf`, `spdep`), data wrangling (`tidyverse`), and machine learning (`tidymodels`). The `pasteurize` function standardizes data cleaning operations for our calls for service dataset, ensuring consistency in column naming and formatting.
+
+
+### 2.1.1 Setting Up the Environment
+
+```{r initialization, results=FALSE}
+# First install and load basic packages we need for the installation process
+if (!require("pacman")) install.packages("pacman")
+library(pacman)
+
+# Define the list of packages
+packages <- c(
+  # Machine learning packages
+  'tidymodels', 'glmnet', 'ranger', 'earth', 'vip',
+  # Spatial analysis packages
+  'tidygeocoder', 'geojsonio', 'spdep', 'sf',
+  # Data wrangling and viz packages
+  'tidyverse', 'ggplot2', 'ggthemes', 'ggrepel',
+  'janitor', 'knitr', 'readr', 'grid',
+  # Other packages
+  'RSocrata', 'conflicted', 'purrr'
+)
+
+# Install and load all packages
+p_load(char = packages)
+
+# After ensuring conflicted is loaded, set preference
+if (requireNamespace("conflicted", quietly = TRUE)) {
+  conflicted::conflict_prefer('filter', 'dplyr')
+} else {
+  warning("Package 'conflicted' is not available, filter function conflicts may occur")
+}
+
+# Ensure that dplyr's filter() function works
+conflict_prefer('filter', 'dplyr')
+
+```
+
+### 2.1.2 Helper Functions
+
+```{r helper_functions}
+# Helper function to clean and standardize data
+pasteurize <- function(df) {
+  # Helper function to clean column names
+  clean_column_names <- function(col_name) {
+    cleaned <- tolower(col_name)
+    cleaned <- gsub("[^a-z0-9_]", "_", cleaned)
+    cleaned <- gsub("_+", "_", cleaned)
+    cleaned <- gsub("^_|_$", "", cleaned)
+    return(cleaned)
+  }
+  
+  # Helper function for title case conversion
+  to_title_case <- function(x) {
+    # Ensure we're working with a character vector
+    if (!is.character(x)) return(x)
+    # Apply transformation to each element in the vector
+    sapply(x, function(str) {
+      # Handle NA values
+      if (is.na(str)) return(NA)
+      # Split into words and capitalize first letter of each
+      words <- strsplit(tolower(str), " ")[[1]]
+      words <- paste0(toupper(substr(words, 1, 1)),
+                     substr(words, 2, nchar(words)))
+      # Rejoin words with spaces
+      paste(words, collapse = " ")
+    })
+  }
+  
+  # Main data cleaning operations
+  df %>%
+    filter(!if_all(everything(), is.na)) %>%
+    distinct() %>%
+    rename_with(clean_column_names) %>%
+    mutate(across(where(is.character),
+                 ~str_trim(.) %>%
+                   to_title_case))
+}
+
+# Function for summarizing dataset statistics
+stat.summarize <- function(df) {
+  numeric_df <- df %>%
+    select(where(is.numeric))
+  
+  # Initialize a list to store results
+  summary_list <- list()
+  
+  # Loop through each numeric column and calculate statistics
+  for (col in names(numeric_df)) {
+    summary_list[[col]] <- c(
+      min = min(numeric_df[[col]], na.rm = TRUE),
+      max = max(numeric_df[[col]], na.rm = TRUE),
+      median = median(numeric_df[[col]], na.rm = TRUE),
+      mean = mean(numeric_df[[col]], na.rm = TRUE),
+      sd = round(sd(numeric_df[[col]], na.rm = TRUE), 2),
+      n = sum(!is.na(numeric_df[[col]]))
+    )
+  }
+  
+  # Combine the results into a data frame and transpose
+  result <- as.data.frame(do.call(rbind, summary_list))
+  
+  # Transpose the result to switch rows and columns
+  result <- as.data.frame(t(result))
+  
+  # Set the column names to the measurements
+  colnames(result) <- names(numeric_df)
+  
+  result %>%
+    kable() %>%
+    return()
+}
+```
+
+### 2.1.3 Data Acquisition
+
+```{r data_acquisition, echo = TRUE}
+# Download neighborhoods spatial file
+path <- './data/neighborhoods.geojson'
+github_url <- 'https://raw.githubusercontent.com/CBurruss/HarvardX-CYO/main/data/neighborhoods.geojson'
+if (!file.exists(path)) {
+  download.file(github_url, path, mode = 'wb') # 'wb' ensures binary mode for non-text files
+} else {
+  message('The neighborhoods file exists!')
+}
+
+# Download 2023 calls for service (cfs)
+path <- './data/cfs-2023.csv'
+if(!file.exists(path)) {
+  # Download data and save it to file
+  cfs_file <- read.socrata('https://data.nola.gov/api/odata/v4/pc5d-tvaw')
+  write.csv(cfs_file, file = path, row.names = FALSE)
+  message('The cfs file has been downloaded and saved to ', path)
+} else {
+  message('The cfs file already exists at ', path, '!')
+}
+
+# Download code violations
+path <- './data/violations.csv'
+if(!file.exists(path)) {
+  # Download data and save it to file
+  violations_file <- read.socrata('https://data.nola.gov/api/odata/v4/3ehi-je3s')
+  write.csv(violations_file, file = path, row.names = FALSE)
+  message('The violations file has been downloaded and saved to ', path)
+} else {
+  message('The violations file already exists at ', path, '!')
+}
+
+# Download 311 calls (for streetlight outages and abandoned vehicles)
+path <- './data/311.csv'
+if(!file.exists(path)) {
+  # Download data and save it to file
+  three11_file <- read.socrata('https://data.nola.gov/api/odata/v4/2jgv-pqrq')
+  write.csv(three11_file, file = path, row.names = FALSE)
+  message('The 311 file has been downloaded and saved to ', path)
+} else {
+  message('The 311 file already exists at ', path, '!')
+}
+
+rm(three11_file)
+
+# Download ch 66 lot abatements
+path <- './data/ch66.csv'
+if(!file.exists(path)) {
+  # Download data and save it to file
+  ch66_file <- read.socrata('https://data.nola.gov/api/odata/v4/xhih-vxs6')
+  write.csv(ch66_file, file = path, row.names = FALSE)
+  message('The ch 66 file has been downloaded and saved to ', path)
+} else {
+  message('The ch 66 file already exists at ', path, '!')
+}
+```
+
+## 2.2 Data Processing and Exploration
+
+### 2.2.1 Processing Calls for Service Data
+
+The calls for service data requires careful processing to extract usable geographic coordinates and convert them into a spatial format compatible with other datasets. We convert the data to a spatial feature (`sf`) object with the WGS 84 coordinate reference system (EPSG:4326) to ensure compatibility with the neighborhoods spatial file.
+
+
+```{r process_cfs}
+# Function to load and process CFS data
+load_cfs_data <- function() {
+  # Read in CFS data
+  cfs <- read.csv("./data/cfs-2023.csv") %>%
+    # Perform a general cleanse
+    pasteurize() %>%
+    # Convert date fields
+    mutate(date = as.Date(timecreate), .after = timecreate) %>%
+    mutate(year = substr(date, 1, 4), .after = date)
+  
+  # Extract coordinates
+  cfs <- cfs %>%
+    mutate(
+      long_lat = str_extract(location, "\\-?\\d+\\.\\d+ \\-?\\d+\\.\\d+"),
+      long_lat = str_replace(long_lat, " ", ",")
+    ) %>%
+    separate(long_lat, into = c("x", "y"), sep = ",") %>%
+    mutate(x = as.numeric(x), y = as.numeric(y)) %>%
+    na.omit()
+  
+  # Convert to spatial object
+  cfs_sf <- cfs %>%
+    st_as_sf(coords = c("x", "y"), crs = 4326, agr = "constant")
+  
+  return(cfs_sf)
+}
+
+cfs <- load_cfs_data()
+
+# Display summary of the dataset
+glimpse(cfs)
+```
+
+### 2.2.2 Identifying Violent Incidents
+
+To classify violent incidents, we developed a keyword-based approach that identifies calls related to violent crimes. This approach was chosen over using official crime classification codes because it allows us to capture a broader range of incidents that may involve violence or threats of violence. We include keywords such as "assault," "shooting," and "homicide," while excluding false positives with exclusion terms like "alarm" and "not occupied."
+
+This classification methodology results in `r sum(cfs$is_violent, na.rm = TRUE)` violent incidents from the total `r nrow(cfs)` calls for service, representing approximately `r round(sum(cfs$is_violent, na.rm = TRUE)/nrow(cfs)*100, 1)`% of all calls.
+
+```{r identify_violent}
+identify_violent_calls <- function(cfs_data) {
+  # Define keywords associated with violent incidents
+  violent_keywords <- c("assault", "shooting", "shot", "homicide", "weapon",
+                       "burglary", "robbery", "carjack", "domestic", "murder",
+                       "stab", "violence", "violent", "fight", "battery", "rape")
+  
+  exclusion_keywords <- c("alarm", "not occupied", "brandish", "shots fired")
+  
+  # Create a new column identifying violent calls
+  cfs_data %>%
+    mutate(
+      typetext_lower = tolower(typetext),
+      is_violent = str_detect(typetext_lower, paste(violent_keywords, collapse = "|")) &
+        !str_detect(typetext_lower, paste(exclusion_keywords, collapse = "|")),
+      predicted_category = if_else(is_violent, "Violent", "Non-violent")
+    )
+}
+
+cfs <- identify_violent_calls(cfs)
+violent_calls <- cfs %>%
+  filter(is_violent == TRUE)
+
+# Summarize violent call types
+cfs %>%
+  filter(is_violent == TRUE) %>%
+  group_by(typetext) %>%
+  summarize(count = n()) %>%
+  mutate(percent = paste0(round(count / sum(count) * 100, 0), '%')) %>%
+  arrange(desc(count)) %>%
+  as_tibble() %>%
+  select(-geometry) %>%
+  head(15) %>%
+  kable(caption = "Top 15 Violent Incident Types in New Orleans (2023)")
+```
+
+### 2.2.3 Processing Neighborhood Data
+
+The neighborhood spatial file undergoes a similar spatial transformation as the CFS data to ensure they can both be mapped with identical scaling parameters.
+
+```{r process_neighborhoods}
+load_neighborhoods <- function() {
+  neighborhoods <- st_read('./data/neighborhoods.geojson') %>%
+    clean_names() %>%
+    st_transform(crs = 4326)
+  
+  return(neighborhoods)
+}
+
+neighborhoods <- load_neighborhoods()
+```
+
+### 2.2.4 Visualizing Neighborhoods and Violent Incidents
+
+```{r visualize_neighborhoods, fig.cap="New Orleans Neighborhoods"}
+# Simple map of neighborhoods
+neighborhood_map <- ggplot() +
+  geom_sf(data = neighborhoods, fill = "lightblue", color = "white") +
+  labs(title = "New Orleans neighborhoods") +
+  theme_solarized()
+
+neighborhood_map
+```
+
+```{r visualize_violent_calls, fig.cap="Violent Calls for Service in New Orleans (2023)"}
+# Map with violent calls as points
+violent_calls_map <- ggplot() +
+  geom_sf(data = neighborhoods, fill = "lightblue", alpha = 0.5, color = "white") +
+  geom_sf(data = violent_calls, color = "darkgrey", alpha = 0.5, size = 0.5) +
+  labs(title = "Violent calls for service in New Orleans (2023)") +
+  theme_solarized()
+
+violent_calls_map
+```
+
+### 2.2.5 Processing Risk Factor Data
+
+Next, the risk factors undergo a similar transformation process as the CFS dataset. The code violations in particular must be geocoded with `tidygeocoder` to map their points across the city. Invalid geometries are handled with either `na.omit()` or `st_make_valid()` to ensure each dataset can be uniformly mapped.
+
+```{r risk_factor_functions}
+# Load code violations
+load_violations <- function() {
+  # Check if the processed file already exists
+  if (!file.exists('./data/violations_sf.RDS')) {
+    # Initial import and clean
+    violations <- read.csv('./data/violations.csv') %>%
+      clean_names() %>%
+      mutate(violationdate = as.Date(violationdate)) %>%
+      mutate(year = (substr(violationdate, 1, 4))) %>%
+      filter(year == '2023') %>%
+      select(-lastupload)
+    
+    # Standardize addresses
+    violations$location_clean <- violations$location
+    violations$location_clean <- gsub(',', ' and', violations$location_clean)
+    violations$address <- paste(violations$location_clean, 'New Orleans, LA')
+    
+    # Geocode if not already
+    if("lat" %in% colnames(violations) && "long" %in% colnames(violations)) {
+      # Use existing coordinates
+      violations_sf <- violations %>%
+        st_as_sf(coords = c("long", "lat"), crs = 4326, agr = "constant") %>%
+        mutate(Legend = 'Code violations') %>%
+        na.omit()
+    } else {
+      # Geocode addresses
+      violations_geo <- violations %>%
+        geocode(address = address,
+                method = 'arcgis',
+                lat = latitude,
+                long = longitude)
+      
+      # Convert to sf object
+      violations_sf <- violations_geo %>%
+        filter(!is.na(latitude) & !is.na(longitude)) %>%
+        st_as_sf(coords = c("longitude", "latitude"), crs = 4326, agr = "constant") %>%
+        mutate(Legend = 'Code violations')
+    }
+    
+    # Save the processed data to an RDS file for future use
+    saveRDS(violations_sf, './data/violations_sf.RDS')
+    message("Geocoding complete!")
+  } else {
+    # Load the pre-processed data from the saved RDS
+    violations_sf <- readRDS('./data/violations_sf.RDS')
+    message("Loaded cached file.")
+  }
+  
+  return(violations_sf)
+}
+
+# Load streetlight outages from 311 data
+load_streetlights <- function() {
+  # Check if 311.csv exists
+  if(file.exists('./data/311.csv')) {
+    lights <- read.csv('./data/311.csv') %>%
+      clean_names() %>%
+      filter(grepl('Streetlight', request_reason))
+    
+    # Convert to spatial object
+    lights_sf <- lights %>%
+      st_as_sf(coords = c('longitude', 'latitude'),
+               crs = 4326,
+               agr = 'constant',
+               remove = FALSE) %>%
+      na.omit()
+    
+    return(lights_sf)
+  } else {
+    stop("311 file not found")
+  }
+}
+
+# Load abandoned vehicles from 311 data
+load_vehicles <- function() {
+  # Check if 311.csv exists
+  if(file.exists('./data/311.csv')) {
+    vehicles <- read.csv('./data/311.csv') %>%
+      clean_names() %>%
+      filter(grepl('Junk Vehicles', request_reason))
+    
+    # Convert to spatial object
+    vehicles_sf <- vehicles %>%
+      st_as_sf(coords = c('longitude', 'latitude'),
+               crs = 4326,
+               agr = 'constant',
+               remove = FALSE) %>%
+      na.omit()
+    
+    return(vehicles_sf)
+  } else {
+    stop("311 file not found")
+  }
+}
+
+# Load chapter 66 abatements
+load_abatements <- function() {
+  # Check if the processed file already exists
+  if (!file.exists('./data/ch66_sf.RDS')) {
+    # Initial import and clean
+    ch66 <- read.csv('./data/ch66.csv') %>%
+      clean_names() %>%
+      mutate(casefiled = as.Date(casefiled)) %>%
+      mutate(year = substr(casefiled, 1, 4), .after = casefiled) %>%
+      filter(year == '2023' & longitude >= -91.18) %>% # exclude cases outside of New Orleans
+      filter(!is.na(longitude) & !is.na(latitude)) %>% # ensure both coordinates are non-NA
+      distinct()
+    
+    # Convert to sf object using existing coordinates
+    ch66_sf <- ch66 %>%
+      st_as_sf(coords = c('longitude', 'latitude'),
+               crs = 4326,
+               agr = "constant") %>%
+      st_make_valid()
+    
+    # Check if the sf object is valid
+    if (any(st_is_valid(ch66_sf) == FALSE)) {
+      warning("Some geometries are invalid after applying st_make_valid()")
+    }
+    
+    # Save the processed data to an RDS file for future use
+    saveRDS(ch66_sf, './data/ch66_sf.RDS')
+    message("Ch 66 abatements data processed and saved.")
+  } else {
+    # Load the pre-processed data from the saved RDS
+    ch66_sf <- readRDS('./data/ch66_sf.RDS')
+    message("Ch 66 abatements data loaded from cache.")
+  }
+  
+  return(ch66_sf)
+}
+```
+
+```{r load_risk_factors}
+# Load all risk factors
+violations <- load_violations()
+streetlights <- load_streetlights()
+vehicles <- load_vehicles()
+abatements <- load_abatements()
+```
+
+## 2.3 Data Aggregation by Neighborhood
+
+Next, we aggregate each dataset at the neighborhood level by interpolating points to each neighborhood geometry. This similarly drops any values which do not map to a corresponding polygon from the neighborhood set.
+
+```{r aggregation_functions}
+# Aggregate violent calls by neighborhood
+aggregate_violent_calls <- function(violent_calls, neighborhoods) {
+  violent_by_neighborhood <- st_join(violent_calls, neighborhoods) %>%
+    group_by(gnocdc_lab) %>%
+    summarize(violent_count = n()) %>%
+    st_drop_geometry()
+  
+  return(violent_by_neighborhood)
+}
+
+# Aggregate code violations by neighborhood
+aggregate_violations <- function(violations, neighborhoods) {
+  violations_by_neighborhood <- st_join(violations, neighborhoods) %>%
+    group_by(gnocdc_lab) %>%
+    summarize(code_violations = n()) %>%
+    st_drop_geometry()
+  
+  return(violations_by_neighborhood)
+}
+
+# Aggregate streetlight outages by neighborhood
+aggregate_streetlights <- function(lights, neighborhoods) {
+  lights_by_neighborhood <- st_join(lights, neighborhoods) %>%
+    group_by(gnocdc_lab) %>%
+    summarize(streetlight_outages = n()) %>%
+    st_drop_geometry()
+  
+  return(lights_by_neighborhood)
+}
+
+# Aggregate abandoned vehicles by neighborhood
+aggregate_vehicles <- function(vehicles, neighborhoods) {
+  vehicles_by_neighborhood <- st_join(vehicles, neighborhoods) %>%
+    group_by(gnocdc_lab) %>%
+    summarize(abandoned_vehicles = n()) %>%
+    st_drop_geometry()
+  
+  return(vehicles_by_neighborhood)
+}
+
+# Aggregate chapter 66 abatements by neighborhood
+aggregate_abatements <- function(ch66, neighborhoods) {
+  ch66_by_neighborhood <- st_join(ch66, neighborhoods) %>%
+    group_by(gnocdc_lab) %>%
+    summarize(lot_abatements = n()) %>%
+    st_drop_geometry()
+  
+  return(ch66_by_neighborhood)
+}
+
+# Join all neighborhood-level data
+create_neighborhood_dataset <- function(neighborhoods, violent_by_neighborhood,
+                                       violations_by_neighborhood,
+                                       lights_by_neighborhood,
+                                       vehicles_by_neighborhood,
+                                       ch66_by_neighborhood) {
+  neighborhood_data <- neighborhoods %>%
+    select(gnocdc_lab, geometry) %>%
+    left_join(violent_by_neighborhood, by = "gnocdc_lab") %>%
+    left_join(violations_by_neighborhood, by = "gnocdc_lab") %>%
+    left_join(lights_by_neighborhood, by = "gnocdc_lab") %>%
+    left_join(vehicles_by_neighborhood, by = "gnocdc_lab") %>%
+    left_join(ch66_by_neighborhood, by = "gnocdc_lab") %>%
+    mutate(across(where(is.numeric), ~replace_na(., 0)))
+  
+  return(neighborhood_data)
+}
+```
+
+```{r aggregate_data}
+# Aggregate data by neighborhood
+violent_by_neighborhood <- aggregate_violent_calls(violent_calls, neighborhoods)
+violations_by_neighborhood <- aggregate_violations(violations, neighborhoods)
+lights_by_neighborhood <- aggregate_streetlights(streetlights, neighborhoods)
+vehicles_by_neighborhood <- aggregate_vehicles(vehicles, neighborhoods)
+ch66_by_neighborhood <- aggregate_abatements(abatements, neighborhoods)
+
+# Create final neighborhood dataset
+neighborhood_data <- create_neighborhood_dataset(
+  neighborhoods,
+  violent_by_neighborhood,
+  violations_by_neighborhood,
+  lights_by_neighborhood,
+  vehicles_by_neighborhood,
+  ch66_by_neighborhood
+)
+```
+
+## 2.4 Statistical Analysis
+
+### 2.4.1 Correlation Analysis
+
+We chose Pearson correlation analysis to examine relationships between urban disorder indicators and violent incidents because it provides a standardized measure of linear association between variables. While correlation does not imply causation, strong correlations suggest potential predictive relationships that can be explored further with more complex models.
+
+```{r correlation_analysis}
+# Define a function for running a correlation between risk factors and violent calls
+run_correlation_analysis <- function(neighborhood_data) {
+  # Prepare data for correlation
+  corr_data <- neighborhood_data %>%
+    st_drop_geometry() %>%
+    select(violent_count, code_violations, streetlight_outages,
+           abandoned_vehicles, lot_abatements)
+  
+  # Calculate correlation matrix
+  cor_matrix <- cor(corr_data, use = "pairwise.complete.obs")
+  
+  # Calculate correlation with p-values
+  corr_results <- data.frame()
+  predictors <- c("code_violations", "streetlight_outages",
+                 "abandoned_vehicles", "lot_abatements")
+  
+  for (predictor in predictors) {
+    test <- cor.test(
+      neighborhood_data[[predictor]],
+      neighborhood_data[["violent_count"]],
+      use = "pairwise.complete.obs"
+    )
+    
+    corr_results <- rbind(corr_results, data.frame(
+      factor = predictor,
+      correlation = test$estimate,
+      p_value = test$p.value,
+      significance = case_when(
+        test$p.value < 0.001 ~ "***",
+        test$p.value < 0.01 ~ "**",
+        test$p.value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      )
+    ))
+  }
+  
+  # Return both correlation matrix and detailed test results
+  return(list(
+    correlation_matrix = cor_matrix,
+    correlation_tests = corr_results
+  ))
+}
+
+# Run the correlation analysis
+correlation_results <- run_correlation_analysis(neighborhood_data)
+kable(correlation_results$correlation_tests, 
+      caption = "Correlation of Urban Disorder Indicators with Violent Incidents")
+```
+
+### 2.4.2 Visualizing Relationships
+
+```{r visualize_correlation_code, fig.cap="Relationship between Code Violations and Violent Calls"}
+# Dot plot of code violations vs violent calls with smoothing line
+ggplot(neighborhood_data %>% st_drop_geometry(),
+       aes(x = code_violations, y = violent_count)) +
+  geom_point(color = "blue", alpha = 0.7) +
+  geom_smooth(method = "lm", color = "blue") +
+  theme_solarized() +
+  labs(title = "Relationship between code violations and violent calls",
+       x = "Number of code violations",
+       y = "Number of violent calls") +
+  geom_text_repel(aes(label = str_to_title(gnocdc_lab)), size = 3, max.overlaps = 10)
+```
+
+```{r visualize_correlation_lights, fig.cap="Relationship between Streetlight Outages and Violent Calls"}
+# Dot plot of code violations vs violent calls with smoothing line
+ggplot(neighborhood_data %>% st_drop_geometry(),
+       aes(x = streetlight_outages, y = violent_count)) +
+  geom_point(color = "purple4", alpha = 0.7) +
+  geom_smooth(method = "lm", color = "purple4") +
+  theme_solarized() +
+  labs(title = "Relationship between streetlight outages and violent calls",
+       x = "Number of streetlight outages",
+       y = "Number of violent calls") +
+  geom_text_repel(aes(label = str_to_title(gnocdc_lab)), size = 3, max.overlaps = 10)
+```
+
+```{r visualize_all_correlations, fig.cap="Relationship between All Risk Factors and Violent Calls"}
+# First, prepare the data in long format
+correlation_data <- neighborhood_data %>%
+  st_drop_geometry() %>%
+  select(gnocdc_lab, violent_count, code_violations, streetlight_outages,
+         abandoned_vehicles, lot_abatements) %>%
+  pivot_longer(cols = c(code_violations, streetlight_outages,
+                         abandoned_vehicles, lot_abatements),
+               names_to = "risk_factor",
+               values_to = "count")
+
+# Create plot with all risk factors colored differently
+ggplot(correlation_data, aes(x = count, y = violent_count, color = risk_factor)) +
+  geom_point(alpha = 0.7) +
+  geom_smooth(method = "lm", se = TRUE, aes(fill = risk_factor), alpha = 0.1) +
+  scale_color_brewer(palette = "Set1",
+                    labels = c("Abandoned Vehicles", "Code Violations",
+                              "Lot Abatements", "Streetlight Outages")) +
+  scale_fill_brewer(palette = "Set1",
+                   labels = c("Abandoned Vehicles", "Code Violations",
+                             "Lot Abatements", "Streetlight Outages")) +
+  theme_solarized() +
+  labs(title = "Relationship between risk factors and violent calls",
+       x = "Count of risk factors",
+       y = "Number of violent calls",
+       color = "Risk factor",
+       fill = "Risk factor") +
+  theme(legend.position = "right")
+```
+
+# 3. Predictive Modeling
+
+## 3.1 Data Preparation for Modeling
+
+We split our dataset into training (80%) and testing (20%) sets using stratified sampling. This 80/20 split represents a balance between providing sufficient data for model training while retaining enough for meaningful evaluation. We chose this split ratio based on the smaller size of our dataset and the need to ensure adequate representation of all neighborhoods in both training and testing sets.
+
+For cross-validation, we implement 5-fold cross-validation, which lets us balance computational efficiency and performance estimation. With our limited number of neighborhoods, using more folds (e.g., 10-fold) could result in too few samples per fold, while fewer folds might not provide sufficient performance estimates.
+
+```{r prepare_ml_data}
+prepare_ml_data <- function(neighborhood_data) {
+  # Prepare data for modeling
+  model_data <- neighborhood_data %>%
+    st_drop_geometry() %>%
+    select(violent_count, code_violations, streetlight_outages,
+           abandoned_vehicles, lot_abatements) %>%
+    # Remove any rows with NA values
+    na.omit()
+  
+  # Split into training and testing sets (80/20)
+  set.seed(90210)
+  data_split <- initial_split(model_data, prop = 0.8)
+  train_data <- training(data_split)
+  test_data <- testing(data_split)
+  
+  # Create validation set for tuning
+  set.seed(90210)
+  cv_folds <- vfold_cv(train_data, v = 5)
+  
+  return(list(
+    train_data = train_data,
+    test_data = test_data,
+    cv_folds = cv_folds,
+    full_data = model_data
+  ))
+}
+
+ml_data <- prepare_ml_data(neighborhood_data)
+```
+
+## 3.2 Linear Regression Model
+
+We begin with linear regression as our baseline model due to its interpretability, including the benefit of quantifying the individual contribution of each risk factor in the model. Linear regression expects a linear relationship between predictors and our outcome, which is a reasonable assumption about our data based on the initial correlation analysis.
+
+```{r linear_regression}
+# Re-establish seed
+set.seed(90210)
+
+# Define a function for the lm model
+build_lm_model <- function(ml_data) {
+  # Define the model specification
+  lm_spec <- linear_reg() %>%
+    set_engine("lm") %>%
+    set_mode("regression")
+  
+  # Define the workflow
+  lm_workflow <- workflow() %>%
+    add_formula(violent_count ~ .) %>%
+    add_model(lm_spec)
+  
+  # Fit the model
+  lm_fit <- lm_workflow %>%
+    fit(data = ml_data$train_data)
+  
+  # Predictions on test data
+  lm_predictions <- lm_fit %>%
+    predict(ml_data$test_data) %>%
+    bind_cols(ml_data$test_data)
+  
+  # Calculate performance metrics
+  lm_metrics <- lm_predictions %>%
+    metrics(truth = violent_count, estimate = .pred)
+  
+  # Extract model coefficients
+  lm_coefs <- lm_fit %>%
+    extract_fit_parsnip() %>%
+    tidy() %>%
+    mutate(intercept_flag = if_else(term == "(Intercept)", 1, 0)) %>%
+    arrange(desc(intercept_flag), desc(estimate)) %>%
+    select(-intercept_flag)  # Remove the intercept flag after sorting
+  
+  return(list(
+    workflow = lm_workflow,
+    model = lm_fit,
+    predictions = lm_predictions,
+    metrics = lm_metrics,
+    coefficients = lm_coefs
+  ))
+}
+
+# Print results of the linear model
+lm_results <- build_lm_model(ml_data)
+```
+
+```{r lm_results}
+# Display linear model performance metrics
+cat("Linear Model Performance Metrics:\n")
+kable(lm_results$metrics)
+
+cat("\nModel Coefficients:\n")
+kable(lm_results$coefficients)
+```
+
+## 3.3 Random Forest Model
+
+We implement random forest as our first advanced model because it can capture non-linear relationships and interactions between variables without requiring explicit specification. Unlike linear regression, random forest models are resistant to overfitting, handle multicollinearity well, and provide measures of variable importance that can offer insights beyond standard regression coefficients.
+
+For the random forest model, we tune two key hyperparameters:
+1. `mtry`: The number of variables randomly sampled as candidates at each split. We test values from 1 to 4 (the total number of predictors).
+2. `min_n`: The minimum number of observations needed in a node to be considered for splitting. We test values from 2 to 10.
+
+We fix the number of trees at 1,000 to ensure model stability while maintaining computational efficiency.
+
+```{r random_forest}
+# Re-establish seed
+set.seed(90210)
+
+# Build Random Forest model with tidymodels
+build_rf_model <- function(ml_data) {
+  # Define the model specification
+  rf_spec <- rand_forest(
+    mtry = tune(),
+    trees = 1000,
+    min_n = tune()
+  ) %>%
+    set_engine("ranger", importance = "impurity") %>%
+    set_mode("regression")
+  
+  # Define the workflow
+  rf_workflow <- workflow() %>%
+    add_formula(violent_count ~ .) %>%
+    add_model(rf_spec)
+  
+  # Define the grid for tuning
+  rf_grid <- grid_regular(
+    mtry(range = c(1, 4)),
+    min_n(range = c(2, 10)),
+    levels = 1
+  )
+  
+  # Tune the model
+  rf_tune_results <- rf_workflow %>%
+    tune_grid(
+      resamples = ml_data$cv_folds,
+      grid = rf_grid,
+      metrics = metric_set(rmse, rsq)
+    )
+  
+  # Select best hyperparameters
+    rf_best_params <- rf_tune_results %>%
+    select_best(metric = "rmse")
+  
+  # Finalize workflow with best parameters
+  rf_final_workflow <- rf_workflow %>%
+    finalize_workflow(rf_best_params)
+  
+  # Fit the final model
+  rf_final_fit <- rf_final_workflow %>%
+    fit(data = ml_data$train_data)
+  
+  # Predictions on test data
+  rf_predictions <- rf_final_fit %>%
+    predict(ml_data$test_data) %>%
+    bind_cols(ml_data$test_data)
+  
+  # Calculate performance metrics
+  rf_metrics <- rf_predictions %>%
+    metrics(truth = violent_count, estimate = .pred)
+  
+  # Extract variable importance
+  rf_imp <- rf_final_fit %>%
+    extract_fit_parsnip() %>%
+    vip::vi()
+  
+  return(list(
+    workflow = rf_final_workflow,
+    model = rf_final_fit,
+    predictions = rf_predictions,
+    metrics = rf_metrics,
+    importance = rf_imp,
+    tuning_results = rf_tune_results
+  ))
+}
+
+# Run random forest model
+rf_results <- build_rf_model(ml_data)
+```
+
+
+```{r random_forest_results}
+# Print results of the random forest model
+cat("Random Forest Performance Metrics:\n")
+kable(rf_results$metrics)
+
+cat("\nVariable Importance:\n")
+kable(rf_results$importance)
+```
+
+## 3.4 Elastic Net Regression Model
+
+
+Next, we implement an elastic net regularization parameter on a regression model. This form of regression combines the penalties of both lasso and ridge regularization, making it particularly useful when dealing with potentially correlated predictors. By tuning the mixture parameter (alpha), we can determine the optimal balance between the L1 and L2 penalties. We include this model to compare with our other approaches and to potentially identify the most important predictors while controlling for multicollinearity among our risk factors.
+
+```{r elastic_net}
+# Re-establish seed
+set.seed(90210)
+
+build_elastic_net_model <- function(ml_data) {
+  # Define the model specification
+  en_spec <- linear_reg(
+    penalty = tune(),
+    mixture = tune()
+  ) %>%
+    set_engine("glmnet") %>%
+    set_mode("regression")
+  
+  # Create pre-processing recipe
+  en_recipe <- recipe(violent_count ~ ., data = ml_data$train_data) %>%
+    step_normalize(all_predictors())
+  
+  # Define the workflow
+  en_workflow <- workflow() %>%
+    add_recipe(en_recipe) %>%
+    add_model(en_spec)
+  
+  # Define the grid for tuning
+  # Using smaller, more appropriate values for penalty
+  en_grid <- grid_regular(
+    penalty(range = c(0.001, 1.0)), # Values between 0 and 1
+    mixture(range = c(0, 1)), # Values between 0 and 1
+    levels = c(10, 5)
+  )
+  
+  # Tune the model
+  en_tune_results <- en_workflow %>%
+    tune_grid(
+      resamples = ml_data$cv_folds,
+      grid = en_grid,
+      metrics = metric_set(rmse, rsq)
+    )
+  
+  # Select best hyperparameters
+  en_best_params <- en_tune_results %>%
+    select_best(metric = "rmse")
+  
+  # Finalize workflow with best parameters
+  en_final_workflow <- en_workflow %>%
+    finalize_workflow(en_best_params)
+  
+  # Fit the final model
+  en_final_fit <- en_final_workflow %>%
+    fit(data = ml_data$train_data)
+  
+  # Predictions on test data
+  en_predictions <- en_final_fit %>%
+    predict(ml_data$test_data) %>%
+    bind_cols(ml_data$test_data)
+  
+  # Calculate performance metrics
+  en_metrics <- en_predictions %>%
+    metrics(truth = violent_count, estimate = .pred)
+  
+  # Extract model coefficients - handle potential error
+  en_coefs <- tryCatch({
+    en_final_fit %>%
+      extract_fit_parsnip() %>%
+      tidy() %>%
+      arrange(desc(estimate))
+  }, error = function(e) {
+    message("Could not extract coefficients: ", e$message)
+    return(data.frame(term = character(), estimate = numeric()))
+  })
+  
+  return(list(
+    workflow = en_final_workflow,
+    model = en_final_fit,
+    predictions = en_predictions,
+    metrics = en_metrics,
+    coefficients = en_coefs,
+    tuning_results = en_tune_results
+  ))
+}
+
+# Run the elastic net model
+elastic_net_results <- build_elastic_net_model(ml_data)
+```
+
+```{r elastic_net_results}
+# Print results of the elastic net model
+cat("Elastic Net Model Performance Metrics:\n")
+kable(elastic_net_results$metrics)
+
+cat("\nElastic Net Coefficients:\n")
+tryCatch({
+  kable(elastic_net_results$coefficients)
+}, error = function(e) {
+  cat("Could not display coefficients:", e$message)
+})
+```
+
+## 3.5 Multivariate Adaptive Regression Splines (MARS)
+
+Lastly, we attempt a MARS model as an alternative approach to capturing non-linear relationships through piecewise linear segments (splines). This technique automatically determines the optimal locations (knots) where the relationship between predictors and the outcome changes. We include MARS to explore whether the relationship between urban disorder indicators and violent incidents contains significant non-linearities that might not be captured by our other models. This model similarly selects the best hyperparameters to minimize RMSE.
+
+```{r mars}
+# Re-establish seed
+set.seed(90210)
+
+build_mars_model <- function(ml_data) {
+  # Define the model specification
+  mars_spec <- mars(
+    num_terms = tune(),
+    prod_degree = tune()
+  ) %>%
+    set_engine("earth") %>%
+    set_mode("regression")
+  
+  # Define the workflow
+  mars_workflow <- workflow() %>%
+    add_formula(violent_count ~ .) %>%
+    add_model(mars_spec)
+  
+  # Define the grid for tuning
+  mars_grid <- grid_regular(
+    num_terms(range = c(2, 8)), # Number of terms to retain
+    prod_degree(range = c(1, 2)), # Product degree (1 = additive, 2 = two-way interactions)
+    levels = c(4, 2)
+  )
+  
+  # Tune the model
+  mars_tune_results <- mars_workflow %>%
+    tune_grid(
+      resamples = ml_data$cv_folds,
+      grid = mars_grid,
+      metrics = metric_set(rmse, rsq)
+    )
+  
+  # Select best hyperparameters
+  mars_best_params <- mars_tune_results %>%
+    select_best(metric = "rmse")
+  
+  # Finalize workflow with best parameters
+  mars_final_workflow <- mars_workflow %>%
+    finalize_workflow(mars_best_params)
+  
+  # Fit the final model
+  mars_final_fit <- mars_final_workflow %>%
+    fit(data = ml_data$train_data)
+  
+  # Predictions on test data
+  mars_predictions <- mars_final_fit %>%
+    predict(ml_data$test_data) %>%
+    bind_cols(ml_data$test_data)
+  
+  # Calculate performance metrics
+  mars_metrics <- mars_predictions %>%
+    metrics(truth = violent_count, estimate = .pred)
+  
+  return(list(
+    workflow = mars_final_workflow,
+    model = mars_final_fit,
+    predictions = mars_predictions,
+    metrics = mars_metrics,
+    tuning_results = mars_tune_results
+  ))
+}
+
+# Run the MARS model
+mars_results <- build_mars_model(ml_data)
+```
+
+```{r mars_results}
+# Print results of the MARS model
+cat("MARS Performance Metrics:\n")
+kable(mars_results$metrics)
+```
+
+## 3.6 Model Comparison
+
+Finally, we evaluate model performance using two primary metrics:
+1. Root Mean Square Error (RMSE): Measures the average magnitude of prediction errors in the same units as the response variable.
+2. R-squared (R²): Indicates the proportion of variance in violent incidents explained by each model.
+
+We choose these metrics because RMSE provides a concrete measure of prediction accuracy in terms of the number of violent incidents, while R² offers insight into the explanatory power of our models relative to the overall variance in the data.
+
+```{r compare_models}
+compare_models <- function(lm_results, rf_results, elastic_net_results, mars_results) {
+  # Create comparison dataframe
+  model_names <- c("Linear Regression", "Random Forest", "Elastic Net", "MARS")
+  
+  # Prepare metrics for comparison
+  get_rmse <- function(result) {
+    result$metrics %>%
+      filter(.metric == "rmse") %>%
+      pull(.estimate)
+  }
+  
+  get_rsq <- function(result) {
+    result$metrics %>%
+      filter(.metric == "rsq") %>%
+      pull(.estimate)
+  }
+  
+  # Create comparison dataframe
+  rmse_values <- c(
+    get_rmse(lm_results),
+    get_rmse(rf_results),
+    get_rmse(elastic_net_results),
+    get_rmse(mars_results)
+  )
+  
+  rsq_values <- c(
+    get_rsq(lm_results),
+    get_rsq(rf_results),
+    get_rsq(elastic_net_results),
+    get_rsq(mars_results)
+  )
+  
+  # Create and return the comparison dataframe
+  comparison_df <- data.frame(
+    Model = model_names,
+    RMSE = round(rmse_values, 2),
+    R_squared = round(rsq_values, 2)
+  )
+  
+  return(comparison_df)
+}
+
+# Run function to compare all models
+comparison_results <- compare_models(
+  lm_results,
+  rf_results,
+  elastic_net_results,
+  mars_results
+)
+
+# Sort by RMSE (ascending)
+comparison_results %>%
+  arrange(RMSE) %>%
+  kable(caption = "Comprehensive Model Performance Comparison")
+```
+
+# 4. Results and Discussion
+
+## 4.1 Correlation Analysis Findings
+
+Our correlation analysis revealed strong relationships between several urban disorder indicators and violent incidents in New Orleans neighborhoods. Code violations showed the strongest correlation with violent incidents (r = 0.74, p < 0.001), followed by streetlight outages (r = 0.69, p < 0.001) and abandoned vehicles (r = 0.65, p < 0.001). Lot abatements showed a weaker and non-significant correlation (r = 0.16, p = 0.18).
+
+These findings align with the "broken windows" theory of urban disorder, which suggests that visible signs of disorder and neglect may contribute to an environment where crime is more prevalent. The spatial visualization of violent incidents shows clustering in certain neighborhoods, which corresponds with areas that have higher concentrations of code violations and other disorder indicators.
+
+## 4.2 Predictive Model Performance
+
+We compared four predictive models to understand the relationships between urban disorder indicators and violent incidents: linear regression, random forest, elastic net regression, and multivariate adaptive regression splines (MARS).
+
+### 4.2.1 Linear Regression
+
+The linear regression model achieved an RMSE of 218.75 and an R-squared of 0.64, indicating it explains just over two-thirds (64%) of the variance in violent incidents across neighborhoods. The model coefficients reveal that streetlight outages have the strongest predictive relationship with violent incidents, with each outage associated with approximately 0.60 more violent incidents, holding other variables constant. This is a suprising findings because code violations exhibited a higher correlation coefficient (0.74) compared to streetlight outages (0.69) in the original correlation test. However, code violations were also significant predictors, with each violation associated with about 0.50 additional violent incidents. Abandoned vehicles and lot abatements showed minimal and non-significant associations in the linear model.
+
+### 4.2.2 Random Forest
+
+The random forest model performed slightly better than the linear regression model, with an RMSE of 211.16 and a slightly higher R-squared of 0.76. This model's performance suggests that the relationships between the predictors and violent incidents are less linear than originally hypothesized, as the more flexible random forest model did outperform the linear model. The random forest variable importance metrics identified code violations as the most important predictor, followed by streetlight outages, abandoned vehicles, and lot abatements, in that order. This consistency with the linear model strengthens our confidence in the importance of code violations as a predictor of neighborhood violence.
+
+### 4.2.3 Elastic Net Regression
+
+The elastic net model, which combines L1 and L2 regularization to handle potential multicollinearity among predictors, achieved an RMSE of approximately 220.75 and an R-squared of 0.63. Though slightly underperforming compared to the linear regression and random forest models, the elastic net's performance suggests that multicollinearity among our predictors is not a major concern in this dataset. The regularization path identified similar important predictors as the the two previous models, with streetlight outages and code violations having the strongest importance.
+
+### 4.2.4 Multivariate Adaptive Regression Splines (MARS)
+
+The MARS model, which can flexibly capture non-linear relationships between predictors and the outcome, achieved an RMSE of 259.28 and an R-squared of 0.63. This performance ranked last among our models, possibly pointing to the limitations of such small universe of data. The model identified similar key predictors to the other approaches, suggesting that while there may be some non-linearity in the relationships, the overall pattern of importance among predictors remains consistent.
+
+### 4.2.5 Model Comparison
+
+Comparing all four models, the random forest model achieved the lowest RMSE (211.16), suggesting it provides the most accurate predictions on our test set. It was also able to account for the largest portion of variance in our data with an r-squared of 0.76 - substantially higher than our other models.The relative consistency in performance across different modeling approaches suggests that our findings regarding the importance of streetlight outages and code violations as predictors of violent incidents are robust.
+
+The minimal performance differences between linear and more complex models suggest that the relationships between urban disorder indicators and violent incidents are generally linear in nature. This is advantageous from a policy perspective, as linear relationships are more straightforward to interpret and communicate to stakeholders.
+
+## 4.3 Spatial Patterns
+
+The spatial distribution of violent incidents across New Orleans neighborhoods also reveals distinct patterns. Certain neighborhoods consistently show higher concentrations of both violent incidents and urban disorder indicators. This spatial clustering suggests that interventions focused on specific high-risk neighborhoods might be more effective than city-wide approaches.
+
+The neighborhoods with the highest concentrations of violent incidents also tend to have the highest numbers of streetlight outages and code violations, further supporting the correlation between these factors. This spatial coincidence of urban disorder and violence provides additional evidence for the theoretical connection between physical disorder and crime.
+
+## 4.4 Implications of Findings
+
+These findings have several important implications:
+
+1. **Predictive Value of Risk Factors**: The strong and consistent relationship between streetlight outages and code violations with violent incidents across all models suggests that these may serve as valuable early indicators of neighborhood conditions conducive to violence. This provides empirical support for policy approaches that target code enforcement as part of comprehensive violence reduction strategies.
+
+2. **Importance of Infrastructure Maintenance**: The significant relationship between streetlight outages and violent incidents highlights the importance of basic infrastructure maintenance in crime prevention. This finding aligns with situational crime prevention theory, which emphasizes how environmental conditions can influence criminal opportunities (Braga, 2024).
+
+3. **Targeted Intervention Opportunities**: The spatial clustering of both disorder indicators and violent incidents suggests that targeted interventions in high-risk neighborhoods could be particularly effective. Resources for both environmental remediation and crime prevention might be most efficiently allocated by focusing on neighborhoods with high concentrations of streetlight outages and code violations, such as the Central Business District (CBD), Little Woods, Central City and the Seventh Ward.
+
+4. **Integrated Approach**: The multiple predictors identified suggest that an integrated approach addressing various forms of physical disorder simultaneously might be more effective than focusing on single factors in isolation.
+
+# 5. Conclusion
+
+## 5.1 Summary of Findings
+
+This analysis identified significant relationships between urban disorder indicators and violent incidents in New Orleans neighborhoods. Streetlight outages emerged as the strongest predictor of neighborhood violence, followed by code violations and abandoned vehicles. Our predictive models (namely random forests) achieved reasonable accuracy, with R-squared values up to 0.76, indicating that these disorder indicators explain a substantial portion of the variance in violent incidents across neighborhoods.
+
+## 5.2 Implications for Policy and Practice
+
+These findings have several implications for public safety initiatives in New Orleans:
+
+1. **Infrastructure Maintenance**: The significant association between streetlight outages and violent incidents suggests that improving street lighting maintenance could be a relatively straightforward intervention to enhance neighborhood safety.
+
+2. **Targeted Code Enforcement**: Given the strong relationship between code violations and violent incidents, strengthening code enforcement in high-risk neighborhoods could similarly contribute to violence reduction.
+
+3. **Data-Driven Resource Allocation**: The spatial patterns identified in this analysis can inform more targeted allocation of public safety resources to neighborhoods with higher concentrations of risk factors.
+
+4. **Cross-Department Collaboration**: Addressing neighborhood violence effectively may require collaboration across multiple city departments, including the public works and code enforcement departments.
+
+## 5.3 Limitations
+
+Several limitations should be considered when interpreting these results:
+
+1. **Correlation vs. Causation**: While our analysis identified strong correlations between disorder indicators and violent incidents, we cannot establish causation. Other unmeasured factors might influence both disorder indicators and violent incidents.
+
+2. **Data Quality**: Our analysis depends on reported incidents, which may not capture all relevant events. Similarly, under-reporting may vary across neighborhoods, as calls for service suffer drastically from reporting bias, thus limiting its capability to measure crime (Buil-Gil, Moretti & Langton, 2021).
+
+3. **Temporal Dynamics**: This analysis used data from 2023 only, providing a snapshot rather than capturing trends over time.
+
+4. **Socioeconomic Factors**: Our models did not include socioeconomic variables like poverty rates, unemployment, or educational attainment, which may be important factors in understanding variations in neighborhood violence.
+
+## 5.4 Future Research
+
+Future research could build on this work in several ways:
+
+1. **Longitudinal Analysis**: Examining how changes in disorder indicators over time relate to changes in violent incidents could provide stronger evidence for causal relationships.
+
+2. **Additional Variables**: Incorporating socioeconomic data, housing characteristics, and other neighborhood attributes could improve model performance and provide a more comprehensive understanding of neighborhood violence.
+
+3. **Machine Learning Approaches**: More advanced machine learning techniques could potentially identify complex non-linear relationships and interaction effects among predictors.
+
+4. **Smaller Unit of Analysis**: To better address the Modifiable Areal Unit Problem (MAUP), this research implies the value in aggregating points at the census block level to more precisely understand the relationship between various risk factors and violent calls for service. This would also facilitate the introduction of census characteristics into model development.
+
+In conclusion, this analysis provides evidence that easily observable and measurable indicators of urban disorder have predictive value for understanding patterns of violent incidents in New Orleans neighborhoods. These findings can inform more targeted and potentially more effective approaches to improving public safety.
+
+# 6. References
+
+Braga, Anthony A. (2024). Disorder policing to reduce crime: An updated systematic review and meta-analysis. *Criminology & Public Policy*, 23(3), 745-775. https://doi.org/10.1111/1745-9133.12667
+
+Buil-Gil, D., Moretti, A. & Langton, S.H. (2021). The accuracy of crime statistics: assessing the impact of police data bias on geographic crime analysis. *Journal of Experimental Criminology*, 18, 515–541. https://doi.org/10.1007/s11292-021-09457-y
+
+City of New Orleans. (2023). Open Data Portal. Retrieved from https://data.nola.gov/
+
+Kelling, G. L., & Wilson, J. Q. (1982). Broken windows: The police and neighborhood safety. *Atlantic Monthly*, 249(3), 29-38. https://www.theatlantic.com/magazine/archive/1982/03/broken-windows/304465/
